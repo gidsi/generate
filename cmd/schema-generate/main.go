@@ -1,71 +1,88 @@
+// The schema-generate binary reads the JSON schema files passed as arguments
+// and outputs the corresponding Go structs.
 package main
 
 import (
+	"encoding/json"
 	"flag"
 	"fmt"
 	"io"
 	"io/ioutil"
 	"os"
 	"sort"
-
-	"encoding/json"
+	"strings"
 
 	"github.com/a-h/generate"
 	"github.com/a-h/generate/jsonschema"
 )
 
 var (
-	i = flag.String("i", "", "The input JSON Schema file.")
 	o = flag.String("o", "", "The output file for the schema.")
 	p = flag.String("p", "main", "The package that the structs are created in.")
+	i = flag.String("i", "", "A single file path (used for backwards compatibility).")
 )
 
 func main() {
+	flag.Usage = func() {
+		fmt.Fprintf(os.Stderr, "Usage of %s:\n", os.Args[0])
+		flag.PrintDefaults()
+		fmt.Fprintln(os.Stderr, "  paths")
+		fmt.Fprintln(os.Stderr, "\tThe input JSON Schema files.")
+	}
+
 	flag.Parse()
 
-	b, err := ioutil.ReadFile(*i)
-
-	if err != nil {
-		fmt.Fprintln(os.Stderr, "Failed to read the input file with error ", err)
-		return
+	inputFiles := flag.Args()
+	if *i != "" {
+		inputFiles = append(inputFiles, *i)
+	}
+	if len(inputFiles) == 0 {
+		fmt.Fprintln(os.Stderr, "No input JSON Schema files.")
+		flag.Usage()
+		os.Exit(1)
 	}
 
-	schema, err := jsonschema.Parse(string(b))
+	schemas := make([]*jsonschema.Schema, len(inputFiles))
+	for i, file := range inputFiles {
+		b, err := ioutil.ReadFile(file)
+		if err != nil {
+			fmt.Fprintln(os.Stderr, "Failed to read the input file with error ", err)
+			return
+		}
 
-	if err != nil {
-		if jsonError, ok := err.(*json.SyntaxError); ok {
-			line, character, lcErr := lineAndCharacter(b, int(jsonError.Offset))
-			fmt.Fprintf(os.Stderr, "Cannot parse JSON schema due to a syntax error at line %d, character %d: %v\n", line, character, jsonError.Error())
-			if lcErr != nil {
-				fmt.Fprintf(os.Stderr, "Couldn't find the line and character position of the error due to error %v\n", lcErr)
+		schemas[i], err = jsonschema.Parse(string(b))
+		if err != nil {
+			if jsonError, ok := err.(*json.SyntaxError); ok {
+				line, character, lcErr := lineAndCharacter(b, int(jsonError.Offset))
+				fmt.Fprintf(os.Stderr, "Cannot parse JSON schema due to a syntax error at %s line %d, character %d: %v\n", file, line, character, jsonError.Error())
+				if lcErr != nil {
+					fmt.Fprintf(os.Stderr, "Couldn't find the line and character position of the error due to error %v\n", lcErr)
+				}
+				return
 			}
+			if jsonError, ok := err.(*json.UnmarshalTypeError); ok {
+				line, character, lcErr := lineAndCharacter(b, int(jsonError.Offset))
+				fmt.Fprintf(os.Stderr, "The JSON type '%v' cannot be converted into the Go '%v' type on struct '%s', field '%v'. See input file %s line %d, character %d\n", jsonError.Value, jsonError.Type.Name(), jsonError.Struct, jsonError.Field, file, line, character)
+				if lcErr != nil {
+					fmt.Fprintf(os.Stderr, "Couldn't find the line and character position of the error due to error %v\n", lcErr)
+				}
+				return
+			}
+			fmt.Fprintf(os.Stderr, "Failed to parse the input JSON schema file %s with error %v\n", file, err)
 			return
 		}
-		if jsonError, ok := err.(*json.UnmarshalTypeError); ok {
-			line, character, lcErr := lineAndCharacter(b, int(jsonError.Offset))
-			fmt.Fprintf(os.Stderr, "The JSON type '%v' cannot be converted into the Go '%v' type on struct '%s', field '%v'. See input file line %d, character %d\n", jsonError.Value, jsonError.Type.Name(), jsonError.Struct, jsonError.Field, line, character)
-			if lcErr != nil {
-				fmt.Fprintf(os.Stderr, "Couldn't find the line and character position of the error due to error %v\n", lcErr)
-			}
-			return
-		}
-		fmt.Fprintln(os.Stderr, "Failed to parse the input JSON schema with error ", err)
-		return
 	}
 
-	g := generate.New(schema)
+	g := generate.New(schemas...)
 
-	structs, err := g.CreateStructs()
-
+	structs, aliases, err := g.CreateTypes()
 	if err != nil {
 		fmt.Fprintln(os.Stderr, "Failure generating structs: ", err)
 	}
 
-	var w io.Writer
+	var w io.Writer = os.Stdout
 
-	if *o == "" {
-		w = os.Stdout
-	} else {
+	if *o != "" {
 		w, err = os.Create(*o)
 
 		if err != nil {
@@ -74,14 +91,14 @@ func main() {
 		}
 	}
 
-	output(w, structs)
+	output(w, structs, aliases)
 }
 
 func lineAndCharacter(bytes []byte, offset int) (line int, character int, err error) {
 	lf := byte(0x0A)
 
 	if offset > len(bytes) {
-		return 0, 0, fmt.Errorf("Couldn't find offset %d in bytes.", offset)
+		return 0, 0, fmt.Errorf("couldn't find offset %d in %d bytes", offset, len(bytes))
 	}
 
 	// Humans tend to count from 1.
@@ -98,7 +115,7 @@ func lineAndCharacter(bytes []byte, offset int) (line int, character int, err er
 		}
 	}
 
-	return 0, 0, fmt.Errorf("Couldn't find offset %d in bytes.", offset)
+	return 0, 0, fmt.Errorf("couldn't find offset %d in %d bytes", offset, len(bytes))
 }
 
 func getOrderedFieldNames(m map[string]generate.Field) []string {
@@ -123,15 +140,24 @@ func getOrderedStructNames(m map[string]generate.Struct) []string {
 	return keys
 }
 
-func output(w io.Writer, structs map[string]generate.Struct) {
-	//TODO: Use templates.
+func output(w io.Writer, structs map[string]generate.Struct, aliases map[string]generate.Field) {
+	fmt.Fprintln(w, "// Code generated by schema-generate. DO NOT EDIT.")
+	fmt.Fprintln(w)
 	fmt.Fprintf(w, "package %v\n", *p)
+
+	for _, k := range getOrderedFieldNames(aliases) {
+		a := aliases[k]
+
+		fmt.Fprintln(w, "")
+		fmt.Fprintf(w, "// %s\n", a.Name)
+		fmt.Fprintf(w, "type %s %s\n", a.Name, a.Type)
+	}
 
 	for _, k := range getOrderedStructNames(structs) {
 		s := structs[k]
 
 		fmt.Fprintln(w, "")
-		fmt.Fprintf(w, "// %s %s\n", s.Name, s.Description)
+		outputNameAndDescriptionComment(s.Name, s.Description, w)
 		fmt.Fprintf(w, "type %s struct {\n", s.Name)
 
 		for _, fieldKey := range getOrderedFieldNames(s.Fields) {
@@ -148,4 +174,14 @@ func output(w io.Writer, structs map[string]generate.Struct) {
 
 		fmt.Fprintln(w, "}")
 	}
+}
+
+func outputNameAndDescriptionComment(name, description string, w io.Writer) {
+	if strings.Index(description, "\n") == -1 {
+		fmt.Fprintf(w, "// %s %s\n", name, description)
+		return
+	}
+
+	dl := strings.Split(description, "\n")
+	fmt.Fprintf(w, "// %s %s\n", name, strings.Join(dl, "\n// "))
 }

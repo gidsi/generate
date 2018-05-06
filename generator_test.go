@@ -1,6 +1,9 @@
 package generate
 
 import (
+	"encoding/json"
+	"net/url"
+	"reflect"
 	"strings"
 	"testing"
 
@@ -49,15 +52,29 @@ func TestThatStructsAreNamedWell(t *testing.T) {
 		expected string
 	}{
 		{
-			input:    "#/definitions/address",
+			input:    "/definitions/address",
 			expected: "Address",
 		},
 		{
-			input:    "#/Example",
+			input:    "/Example",
 			expected: "Example",
 		},
 		{
-			input:    "#",
+			input:    "/Example",
+			expected: "Example",
+			schema: jsonschema.Schema{
+				NameCount: 1,
+			},
+		},
+		{
+			input:    "/Example",
+			expected: "Example2",
+			schema: jsonschema.Schema{
+				NameCount: 2,
+			},
+		},
+		{
+			input:    "",
 			expected: "TheRootName",
 			schema: jsonschema.Schema{
 				Title: "TheRootName",
@@ -66,7 +83,7 @@ func TestThatStructsAreNamedWell(t *testing.T) {
 	}
 
 	for idx, test := range tests {
-		actual := getStructName(test.input, &test.schema, 1)
+		actual := getTypeName(&url.URL{Fragment: test.input}, &test.schema, 1)
 		if actual != test.expected {
 			t.Errorf("Test %d failed: For input \"%s\", expected \"%s\", got \"%s\"", idx, test.input, test.expected, actual)
 		}
@@ -75,57 +92,74 @@ func TestThatStructsAreNamedWell(t *testing.T) {
 
 func TestFieldGeneration(t *testing.T) {
 	properties := map[string]*jsonschema.Schema{
-		"property1": &jsonschema.Schema{Type: "string"},
-		"property2": &jsonschema.Schema{Reference: "#/definitions/address"},
+		"property1": {TypeValue: "string"},
+		"property2": {Reference: "#/definitions/address"},
+		"property3": {TypeValue: "object", AdditionalProperties: []*jsonschema.Schema{{TypeValue: "integer"}}},
+		"property4": {TypeValue: "object", AdditionalProperties: []*jsonschema.Schema{{TypeValue: "integer"}, {TypeValue: "integer"}}},
+		"property5": {TypeValue: "object", AdditionalProperties: []*jsonschema.Schema{{TypeValue: "object", Properties: map[string]*jsonschema.Schema{"subproperty1": {TypeValue: "integer"}}}}},
+		"property6": {TypeValue: "object", AdditionalProperties: []*jsonschema.Schema{{TypeValue: "object", Properties: map[string]*jsonschema.Schema{"subproperty1": {TypeValue: "integer"}}}}},
 	}
 
 	lookupTypes := map[string]*jsonschema.Schema{
-		"#/definitions/address": &jsonschema.Schema{},
+		"#/definitions/address":  {},
+		"#/properties/property5": properties["property5"].AdditionalProperties[0],
 	}
 
 	requiredFields := []string{"property2"}
-	result, err := getFields("#", properties, lookupTypes, requiredFields)
+	result, err := getFields(&url.URL{}, properties, lookupTypes, requiredFields)
 
 	if err != nil {
 		t.Error("Failed to get the fields: ", err)
 	}
 
-	if len(result) != 2 {
-		t.Errorf("Expected 2 results, but got %d results", len(result))
+	if len(result) != 6 {
+		t.Errorf("Expected 6 results, but got %d results", len(result))
 	}
 
 	testField(result["Property1"], "property1", "Property1", "string", false, t)
 	testField(result["Property2"], "property2", "Property2", "*Address", true, t)
+	testField(result["Property3"], "property3", "Property3", "map[string]int", false, t)
+	testField(result["Property4"], "property4", "Property4", "map[string]interface{}", false, t)
+	testField(result["Property5"], "property5", "Property5", "map[string]*Property5", false, t)
+	testField(result["Property6"], "property6", "Property6", "map[string]*undefined", false, t)
 }
 
 func TestFieldGenerationWithArrayReferences(t *testing.T) {
 	properties := map[string]*jsonschema.Schema{
-		"property1": &jsonschema.Schema{Type: "string"},
-		"property2": &jsonschema.Schema{
-			Type: "array",
+		"property1": {TypeValue: "string"},
+		"property2": {
+			TypeValue: "array",
 			Items: &jsonschema.Schema{
 				Reference: "#/definitions/address",
+			},
+		},
+		"property3": {
+			TypeValue: "array",
+			Items: &jsonschema.Schema{
+				TypeValue:            "object",
+				AdditionalProperties: []*jsonschema.Schema{{TypeValue: "integer"}},
 			},
 		},
 	}
 
 	lookupTypes := map[string]*jsonschema.Schema{
-		"#/definitions/address": &jsonschema.Schema{},
+		"#/definitions/address": {},
 	}
 
 	requiredFields := []string{"property2"}
-	result, err := getFields("#", properties, lookupTypes, requiredFields)
+	result, err := getFields(&url.URL{}, properties, lookupTypes, requiredFields)
 
 	if err != nil {
 		t.Error("Failed to get the fields: ", err)
 	}
 
-	if len(result) != 2 {
-		t.Errorf("Expected 2 results, but got %d results", len(result))
+	if len(result) != 3 {
+		t.Errorf("Expected 3 results, but got %d results", len(result))
 	}
 
 	testField(result["Property1"], "property1", "Property1", "string", false, t)
-	testField(result["Property2"], "property2", "Property2", "[]Address", true, t)
+	testField(result["Property2"], "property2", "Property2", "[]*Address", true, t)
+	testField(result["Property3"], "property3", "Property3", "[]map[string]int", false, t)
 }
 
 func testField(actual Field, expectedJSONName string, expectedName string, expectedType string, expectedToBeRequired bool, t *testing.T) {
@@ -147,16 +181,16 @@ func TestNestedStructGeneration(t *testing.T) {
 	root := &jsonschema.Schema{}
 	root.Title = "Example"
 	root.Properties = map[string]*jsonschema.Schema{
-		"property1": &jsonschema.Schema{
-			Type: "object",
+		"property1": {
+			TypeValue: "object",
 			Properties: map[string]*jsonschema.Schema{
-				"subproperty1": &jsonschema.Schema{Type: "string"},
+				"subproperty1": {TypeValue: "string"},
 			},
 		},
 	}
 
 	g := New(root)
-	results, err := g.CreateStructs()
+	results, _, err := g.CreateTypes()
 
 	if err != nil {
 		t.Error("Failed to create structs: ", err)
@@ -183,13 +217,13 @@ func TestEmptyNestedStructGeneration(t *testing.T) {
 	root := &jsonschema.Schema{}
 	root.Title = "Example"
 	root.Properties = map[string]*jsonschema.Schema{
-		"property1": &jsonschema.Schema{
-			Type: "object",
+		"property1": {
+			TypeValue: "object",
 		},
 	}
 
 	g := New(root)
-	results, err := g.CreateStructs()
+	results, _, err := g.CreateTypes()
 
 	if err != nil {
 		t.Error("Failed to create structs: ", err)
@@ -247,17 +281,17 @@ func TestStructGeneration(t *testing.T) {
 	root.Definitions = make(map[string]*jsonschema.Schema)
 	root.Definitions["address"] = &jsonschema.Schema{
 		Properties: map[string]*jsonschema.Schema{
-			"address1": &jsonschema.Schema{Type: "string"},
-			"zip":      &jsonschema.Schema{Type: "number"},
+			"address1": {TypeValue: "string"},
+			"zip":      {TypeValue: "number"},
 		},
 	}
 	root.Properties = map[string]*jsonschema.Schema{
-		"property1": &jsonschema.Schema{Type: "string"},
-		"property2": &jsonschema.Schema{Reference: "#/definitions/address"},
+		"property1": {TypeValue: "string"},
+		"property2": {Reference: "#/definitions/address"},
 	}
 
 	g := New(root)
-	results, err := g.CreateStructs()
+	results, _, err := g.CreateTypes()
 
 	if err != nil {
 		t.Error("Failed to create structs: ", err)
@@ -270,23 +304,23 @@ func TestStructGeneration(t *testing.T) {
 
 func TestArrayGeneration(t *testing.T) {
 	root := &jsonschema.Schema{
-		Title: "Array of Artists Example",
-		Type:  "array",
+		Title:     "Array of Artists Example",
+		TypeValue: "array",
 		Items: &jsonschema.Schema{
-			Title: "Artist",
-			Type:  "object",
+			Title:     "Artist",
+			TypeValue: "object",
 			Properties: map[string]*jsonschema.Schema{
-				"name":      &jsonschema.Schema{Type: "string"},
-				"birthyear": &jsonschema.Schema{Type: "number"},
+				"name":      {TypeValue: "string"},
+				"birthyear": {TypeValue: "number"},
 			},
 		},
 	}
 
 	g := New(root)
-	results, err := g.CreateStructs()
+	results, _, err := g.CreateTypes()
 
 	if err != nil {
-		t.Error("Failed to create structs: ", err)
+		t.Fatal("Failed to create structs: ", err)
 	}
 
 	if len(results) != 1 {
@@ -294,7 +328,6 @@ func TestArrayGeneration(t *testing.T) {
 	}
 
 	artistStruct, ok := results["Artist"]
-
 	if !ok {
 		t.Errorf("Expected Name to be Artist, that wasn't found, but the struct contains \"%+v\"", results)
 	}
@@ -314,29 +347,30 @@ func TestArrayGeneration(t *testing.T) {
 
 func TestNestedArrayGeneration(t *testing.T) {
 	root := &jsonschema.Schema{
-		Title: "Favourite Bars",
-		Type:  "object",
+		Title:     "Favourite Bars",
+		TypeValue: "object",
 		Properties: map[string]*jsonschema.Schema{
-			"barName": &jsonschema.Schema{Type: "string"},
-			"cities": &jsonschema.Schema{
-				Type: "array",
+			"barName": {TypeValue: "string"},
+			"cities": {
+				TypeValue: "array",
 				Items: &jsonschema.Schema{
-					Title: "City",
+					Title:     "City",
+					TypeValue: "object",
 					Properties: map[string]*jsonschema.Schema{
-						"name":    &jsonschema.Schema{Type: "string"},
-						"country": &jsonschema.Schema{Type: "string"},
+						"name":    {TypeValue: "string"},
+						"country": {TypeValue: "string"},
 					},
 				},
 			},
-			"tags": &jsonschema.Schema{
-				Type:  "array",
-				Items: &jsonschema.Schema{Type: "string"},
+			"tags": {
+				TypeValue: "array",
+				Items:     &jsonschema.Schema{TypeValue: "string"},
 			},
 		},
 	}
 
 	g := New(root)
-	results, err := g.CreateStructs()
+	results, _, err := g.CreateTypes()
 
 	if err != nil {
 		t.Error("Failed to create structs: ", err)
@@ -347,7 +381,6 @@ func TestNestedArrayGeneration(t *testing.T) {
 	}
 
 	fbStruct, ok := results["FavouriteBars"]
-
 	if !ok {
 		t.Errorf("FavouriteBars struct was not found. The results were %+v", results)
 	}
@@ -356,24 +389,24 @@ func TestNestedArrayGeneration(t *testing.T) {
 		t.Errorf("Expected to find the BarName field, but didn't. The struct is %+v", fbStruct)
 	}
 
-	if f, ok := fbStruct.Fields["Cities"]; !ok {
+	f, ok := fbStruct.Fields["Cities"]
+	if !ok {
 		t.Errorf("Expected to find the Cities field on the FavouriteBars, but didn't. The struct is %+v", fbStruct)
-
-		if f.Type != "City" {
-			t.Errorf("Expected to find that the Cities array was of type City, but it was of %s", f.Type)
-		}
+	}
+	if f.Type != "[]*City" {
+		t.Errorf("Expected to find that the Cities array was of type *City, but it was of %s", f.Type)
 	}
 
-	if f, ok := fbStruct.Fields["Tags"]; !ok {
+	f, ok = fbStruct.Fields["Tags"]
+	if !ok {
 		t.Errorf("Expected to find the Tags field on the FavouriteBars, but didn't. The struct is %+v", fbStruct)
+	}
 
-		if f.Type != "array" {
-			t.Errorf("Expected to find that the Tags array was of type array, but it was of %s", f.Type)
-		}
+	if f.Type != "[]string" {
+		t.Errorf("Expected to find that the Tags array was of type string, but it was of %s", f.Type)
 	}
 
 	cityStruct, ok := results["City"]
-
 	if !ok {
 		t.Error("City struct was not found.")
 	}
@@ -384,6 +417,43 @@ func TestNestedArrayGeneration(t *testing.T) {
 
 	if _, ok := cityStruct.Fields["Country"]; !ok {
 		t.Errorf("Expected to find the Country field on the City struct, but didn't. The struct is %+v", cityStruct)
+	}
+}
+
+func TestMultipleSchemaStructGeneration(t *testing.T) {
+	root1 := &jsonschema.Schema{
+		Title: "Root1Element",
+		ID06:  "http://example.com/schema/root1",
+		Properties: map[string]*jsonschema.Schema{
+			"property1": {Reference: "root2#/definitions/address"},
+		},
+	}
+
+	root2 := &jsonschema.Schema{
+		Title: "Root2Element",
+		ID06:  "http://example.com/schema/root2",
+		Properties: map[string]*jsonschema.Schema{
+			"property1": {Reference: "#/definitions/address"},
+		},
+		Definitions: map[string]*jsonschema.Schema{
+			"address": {
+				Properties: map[string]*jsonschema.Schema{
+					"address1": {TypeValue: "string"},
+					"zip":      {TypeValue: "number"},
+				},
+			},
+		},
+	}
+
+	g := New(root1, root2)
+	results, _, err := g.CreateTypes()
+
+	if err != nil {
+		t.Error("Failed to create structs: ", err)
+	}
+
+	if len(results) != 3 {
+		t.Errorf("3 results should have been created, 2 root types and an address, but got %v", getStructNamesFromMap(results))
 	}
 }
 
@@ -418,6 +488,21 @@ func TestThatJavascriptKeyNamesCanBeConvertedToValidGoNames(t *testing.T) {
 			input:       "a.b.c",
 			expected:    "ABC",
 		},
+		{
+			description: "Colons are stripped.",
+			input:       "a:b",
+			expected:    "AB",
+		},
+		{
+			description: "GT and LT are stripped.",
+			input:       "a<b>",
+			expected:    "AB",
+		},
+		{
+			description: "Not allowed to start with a number.",
+			input:       "123ABC",
+			expected:    "_123ABC",
+		},
 	}
 
 	for _, test := range tests {
@@ -433,14 +518,14 @@ func TestThatArraysWithoutDefinedItemTypesAreGeneratedAsEmptyInterfaces(t *testi
 	root := &jsonschema.Schema{}
 	root.Title = "Array without defined item"
 	root.Properties = map[string]*jsonschema.Schema{
-		"name": &jsonschema.Schema{Type: "string"},
-		"repositories": &jsonschema.Schema{
-			Type: "array",
+		"name": {TypeValue: "string"},
+		"repositories": {
+			TypeValue: "array",
 		},
 	}
 
 	g := New(root)
-	results, err := g.CreateStructs()
+	results, _, err := g.CreateTypes()
 
 	if err != nil {
 		t.Errorf("Error generating structs: %v", err)
@@ -459,4 +544,210 @@ func TestThatArraysWithoutDefinedItemTypesAreGeneratedAsEmptyInterfaces(t *testi
 			t.Errorf("Expected the ArrayWithoutDefinedItem type to have a Repostitories field, but none was found.")
 		}
 	}
+}
+
+func TestThatTypesWithMultipleDefinitionsAreGeneratedAsEmptyInterfaces(t *testing.T) {
+	root := &jsonschema.Schema{}
+	root.Title = "Multiple possible types"
+	root.Properties = map[string]*jsonschema.Schema{
+		"name": {TypeValue: []interface{}{"string", "integer"}},
+	}
+
+	g := New(root)
+	results, _, err := g.CreateTypes()
+
+	if err != nil {
+		t.Errorf("Error generating structs: %v", err)
+	}
+
+	if _, contains := results["MultiplePossibleTypes"]; !contains {
+		t.Errorf("The MultiplePossibleTypes type should have been made, but only types %s were made.", strings.Join(getStructNamesFromMap(results), ", "))
+	}
+
+	if o, ok := results["MultiplePossibleTypes"]; ok {
+		if f, ok := o.Fields["Name"]; ok {
+			if f.Type != "interface{}" {
+				t.Errorf("Since the schema has multiple types for the item, the property type should be []interface{}, but was %s.", f.Type)
+			}
+		} else {
+			t.Errorf("Expected the MultiplePossibleTypes type to have a Name field, but none was found.")
+		}
+	}
+}
+
+func TestThatUnmarshallingIsPossible(t *testing.T) {
+	// {
+	//     "$schema": "http://json-schema.org/draft-04/schema#",
+	//     "name": "Example",
+	//     "type": "object",
+	//     "properties": {
+	//         "name": {
+	//             "type": ["object", "array", "integer"],
+	//             "description": "name"
+	// 		}
+	//     }
+	// }
+
+	tests := []struct {
+		name     string
+		input    string
+		expected Root
+	}{
+		{
+			name:  "map",
+			input: `{ "name": { "key": "value" } }`,
+			expected: Root{
+				Name: map[string]interface{}{
+					"key": "value",
+				},
+			},
+		},
+		{
+			name:  "array",
+			input: `{ "name": [ "a", "b" ] }`,
+			expected: Root{
+				Name: []interface{}{"a", "b"},
+			},
+		},
+		{
+			name:  "integer",
+			input: `{ "name": 1 }`,
+			expected: Root{
+				Name: 1.0, // can't determine whether it's a float or integer without additional info
+			},
+		},
+	}
+
+	for _, test := range tests {
+		var actual Root
+		err := json.Unmarshal([]byte(test.input), &actual)
+		if err != nil {
+			t.Errorf("%s: error unmarshalling: %v", test.name, err)
+		}
+
+		expectedType := reflect.TypeOf(test.expected.Name)
+		actualType := reflect.TypeOf(actual.Name)
+		if expectedType != actualType {
+			t.Errorf("expected Name to be of type %v, but got %v", expectedType, actualType)
+		}
+	}
+}
+
+func TestThatRootTypeKeyIsCorrectlyAssessed(t *testing.T) {
+	tests := []struct {
+		name     string
+		input    string
+		expected bool
+	}{
+		{
+			name:     "URL without fragment",
+			input:    "http://example.com/schema",
+			expected: true,
+		},
+		{
+			name:     "URL with fragment",
+			input:    "http://example.com/schema#/definitions/foo",
+			expected: false,
+		},
+		{
+			name:     "simple ID without fragment",
+			input:    "/Test",
+			expected: true,
+		},
+		{
+			name:     "simple ID with fragment",
+			input:    "/Test#/definitions/foo",
+			expected: false,
+		},
+		{
+			name:     "no ID",
+			input:    "#",
+			expected: true,
+		},
+		{
+			name:     "empty",
+			input:    "",
+			expected: true,
+		},
+	}
+
+	for _, test := range tests {
+		key, err := url.Parse(test.input)
+		if err != nil {
+			t.Fatal(err)
+		}
+
+		actual := isRootSchemaKey(key)
+		if actual != test.expected {
+			t.Errorf("Test %q failed: for input %q, expected %t, got %t", test.name, test.input, test.expected, actual)
+		}
+	}
+}
+
+func TestTypeAliases(t *testing.T) {
+	tests := []struct {
+		gotype           string
+		input            *jsonschema.Schema
+		structs, aliases int
+	}{
+		{
+			gotype:  "string",
+			input:   &jsonschema.Schema{TypeValue: "string"},
+			structs: 0,
+			aliases: 1,
+		},
+		{
+			gotype:  "int",
+			input:   &jsonschema.Schema{TypeValue: "integer"},
+			structs: 0,
+			aliases: 1,
+		},
+		{
+			gotype:  "bool",
+			input:   &jsonschema.Schema{TypeValue: "boolean"},
+			structs: 0,
+			aliases: 1,
+		},
+		{
+			gotype: "[]*Foo",
+			input: &jsonschema.Schema{TypeValue: "array",
+				Items: &jsonschema.Schema{
+					TypeValue: "object",
+					Title:     "foo",
+				}},
+			structs: 1,
+			aliases: 1,
+		},
+		{
+			gotype:  "[]interface{}",
+			input:   &jsonschema.Schema{TypeValue: "array"},
+			structs: 0,
+			aliases: 1,
+		},
+	}
+
+	for _, test := range tests {
+		g := New(test.input)
+		structs, aliases, err := g.CreateTypes()
+		if err != nil {
+			t.Fatal(err)
+		}
+
+		if len(structs) != test.structs {
+			t.Errorf("Expected %d structs, got %d", test.structs, len(structs))
+		}
+
+		if len(aliases) != test.aliases {
+			t.Errorf("Expected %d type aliases, got %d", test.aliases, len(aliases))
+		}
+
+		if test.gotype != aliases["Root"].Type {
+			t.Errorf("Expected Root type %q, got %q", test.gotype, aliases["Root"].Type)
+		}
+	}
+}
+
+// Root is an example of a generated type.
+type Root struct {
+	Name interface{} `json:"name,omitempty"`
 }
